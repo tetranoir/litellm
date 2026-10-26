@@ -70,7 +70,9 @@ from litellm.types.llms.base import CachedTokensDetails
 from litellm.types.llms.openai import (
     AllMessageValues,
     ChatCompletionAssistantMessage,
+    ChatCompletionAudioObject,
     ChatCompletionCachedContent,
+    ChatCompletionFileObject,
     ChatCompletionImageObject,
     ChatCompletionImageUrlObject,
     ChatCompletionRedactedThinkingBlock,
@@ -98,6 +100,7 @@ from litellm.types.llms.openai import (
     ResponsesAPIResponse,
     ResponsesAPIStatus,
     ToolChoice,
+    ToolMessageContentPart,
     ValidChatCompletionMessageContentTypes,
     ValidChatCompletionMessageContentTypesLiteral,
 )
@@ -225,6 +228,10 @@ class ResponsesReasoningChatForm:
     summary: str | None
 
 
+class _ResponsesFilePart(ChatCompletionFileObject, total=False):
+    cache_control: ReadOnly[object]
+
+
 if TYPE_CHECKING:
     from openai.types.responses.response_apply_patch_tool_call import (
         ResponseApplyPatchToolCall,
@@ -236,11 +243,26 @@ TOOL_CALLS_CACHE: Final = InMemoryCache()
 _ANY_KEY_DICT_ADAPTER: Final = TypeAdapter(dict[object, object])
 _STR_KEY_DICT_ADAPTER: Final = TypeAdapter(dict[str, object])
 _OBJECT_LIST_ADAPTER: Final = TypeAdapter(list[object])
+_AUDIO_PART_ADAPTER: Final = TypeAdapter(ChatCompletionAudioObject)
+_IMAGE_URL_ADAPTER: Final = TypeAdapter(ChatCompletionImageUrlObject)
+_FILE_PART_ADAPTER: Final = TypeAdapter(_ResponsesFilePart)
 _MessageT = TypeVar("_MessageT")
+_MediaT: Final = TypeVar("_MediaT")
 _CACHED_CONTENT_ADAPTER: Final = TypeAdapter(ChatCompletionCachedContent)
 _DICT_ITEMS_LIST_ADAPTER: Final = TypeAdapter(list[dict[object, object]])
 _TEXT_ADAPTER: Final = TypeAdapter(str)
 _RESPONSES_API_TOOL_CHOICE_ADAPTER: Final = TypeAdapter(ToolChoice)
+
+
+def _validate_responses_media(validate: Callable[[], _MediaT]) -> _MediaT:
+    try:
+        return validate()
+    except ValidationError as exc:
+        raise litellm.BadRequestError(
+            message="Invalid Responses media content: check the fields of the image, audio, or file part.",
+            model="",
+            llm_provider="",
+        ) from exc
 
 
 @runtime_checkable
@@ -2293,31 +2315,28 @@ class LiteLLMCompletionResponsesConfig:
 
         def _normalize_function_call_output_to_tool_content(
             output: object,
-        ) -> str | list[ChatCompletionTextObject | ChatCompletionImageObject]:
+        ) -> str | list[ToolMessageContentPart]:
             """
-            Normalize Responses API function_call_output.output into a shape that downstream
-            chat adapters (esp. Gemini) can reliably consume.
-
-            OpenAI Responses API typically uses:
-            - output: string
-
-            Some clients/adapters send:
-            - output: [{"type": "input_text", "text": "..."}, {"type": "input_image", ...}]
-
-            For chat tool messages we normalize to either:
-            - string (preferred)
-            - list of {"type": "text"|"image_url", ...} blocks (for multimodal tool outputs)
+            Preserve structured media for downstream chat adapters and token estimation.
+            Text-only outputs retain their existing string representation.
             """
             if output is None:
                 return ""
             if isinstance(output, str):
                 return output
 
+            output_parts: Final = (
+                [output]
+                if isinstance(output, Mapping)
+                and output.get("type")
+                in ("computer_screenshot", "input_image", "image_url", "input_audio", "input_file", "file")
+                else output
+            )
             # Some adapters represent tool output as a list of "input_*" parts
-            if isinstance(output, list):
-                normalized_blocks: Final[list[ChatCompletionTextObject | ChatCompletionImageObject]] = []
+            if isinstance(output_parts, list):
+                normalized_blocks: Final[list[ToolMessageContentPart]] = []
                 text_acc: Final[list[str]] = []
-                for part in output:
+                for part in output_parts:
                     if not isinstance(part, dict):
                         continue
                     part_type = part.get("type")
@@ -2326,23 +2345,24 @@ class LiteLLMCompletionResponsesConfig:
                         if isinstance(txt, str) and txt:
                             text_acc.append(txt)
                             normalized_blocks.append({"type": "text", "text": txt})
-                    elif part_type in ("input_image", "image_url"):
-                        image_url_val = part.get("image_url") or part.get("url")
-                        if isinstance(image_url_val, dict):
-                            url = image_url_val.get("url")
-                            if isinstance(url, str) and url:
-                                normalized_blocks.append({"type": "image_url", "image_url": {"url": url}})
-                        elif isinstance(image_url_val, str) and image_url_val:
-                            normalized_blocks.append(
-                                {
-                                    "type": "image_url",
-                                    "image_url": {"url": image_url_val},
-                                }
+                    elif part_type in ("input_image", "image_url", "computer_screenshot"):
+                        normalized_blocks.append(
+                            LiteLLMCompletionResponsesConfig._transform_input_image_item_to_image_item(part)
+                        )
+                    elif part_type == "input_audio":
+                        normalized_blocks.append(
+                            _validate_responses_media(partial(_AUDIO_PART_ADAPTER.validate_python, part))
+                        )
+                    elif part_type in ("input_file", "file"):
+                        normalized_blocks.append(
+                            LiteLLMCompletionResponsesConfig._transform_input_file_item_to_file_item(
+                                _validate_responses_media(partial(_STR_KEY_DICT_ADAPTER.validate_python, part))
                             )
+                            if part_type == "input_file"
+                            else _validate_responses_media(partial(_FILE_PART_ADAPTER.validate_python, part))
+                        )
 
-                # Prefer structured blocks if we have images; otherwise return a string.
-                if any(b.get("type") == "image_url" for b in normalized_blocks):
-                    # Ensure we include any accumulated text as text blocks too
+                if any(b.get("type") != "text" for b in normalized_blocks):
                     return normalized_blocks
                 if text_acc:
                     return "".join(text_acc)
@@ -2482,7 +2502,7 @@ class LiteLLMCompletionResponsesConfig:
         return item.get("file_id") or item.get("file_url") or None
 
     @staticmethod
-    def _transform_input_file_item_to_file_item(item: Mapping[str, object]) -> dict[str, object]:
+    def _transform_input_file_item_to_file_item(item: Mapping[str, object]) -> _ResponsesFilePart:
         """
         Transform a Responses API input_file item to a Chat Completion file item
 
@@ -2500,21 +2520,49 @@ class LiteLLMCompletionResponsesConfig:
             file_dict["file_data"] = item["file_data"]
         if item.get("filename"):
             file_dict["filename"] = item["filename"]
+        media_format: Final = item.get("format") or item.get("mime_type") or item.get("content_type")
+        if media_format is not None:
+            file_dict["format"] = media_format
+        if "detail" in item:
+            file_dict["detail"] = item["detail"]
 
         new_item: Final[dict[str, object]] = {"type": "file", "file": file_dict}
         if "cache_control" in item:
             new_item["cache_control"] = item["cache_control"]
-        return new_item
+        return _validate_responses_media(partial(_FILE_PART_ADAPTER.validate_python, new_item))
 
     @staticmethod
     def _transform_input_image_item_to_image_item(
-        item: Mapping[str, str],
+        item: Mapping[str, object],
     ) -> ChatCompletionImageObject:
         """
         Transform a Responses API input_image item to a Chat Completion image item
         """
-        image_url_obj: Final = ChatCompletionImageUrlObject(
-            url=item.get("image_url") or "", detail=item.get("detail") or "auto"
+        source: Final = item.get("image_url") or item.get("url")
+        source_fields: Final = (
+            _validate_responses_media(partial(_STR_KEY_DICT_ADAPTER.validate_python, source))
+            if isinstance(source, Mapping)
+            else {}
+        )
+        url: Final = source_fields.get("url") if source_fields else source
+        detail: Final = source_fields.get("detail") or item.get("detail")
+        media_format: Final = (
+            source_fields.get("format")
+            or source_fields.get("mime_type")
+            or source_fields.get("content_type")
+            or item.get("format")
+            or item.get("mime_type")
+            or item.get("content_type")
+        )
+        image_url_obj: Final = _validate_responses_media(
+            partial(
+                _IMAGE_URL_ADAPTER.validate_python,
+                {
+                    "url": url if isinstance(url, str) else "",
+                    "detail": detail if isinstance(detail, str) else "auto",
+                    **({"format": media_format} if media_format is not None else {}),
+                },
+            )
         )
 
         return ChatCompletionImageObject(type="image_url", image_url=image_url_obj)
@@ -2543,7 +2591,11 @@ class LiteLLMCompletionResponsesConfig:
                 elif isinstance(item, dict):
                     if item.get("type") == "input_file":
                         content_list.append(
-                            LiteLLMCompletionResponsesConfig._transform_input_file_item_to_file_item(item)
+                            dict(
+                                LiteLLMCompletionResponsesConfig._transform_input_file_item_to_file_item(
+                                    _validate_responses_media(partial(_STR_KEY_DICT_ADAPTER.validate_python, item))
+                                )
+                            )
                         )
                     elif item.get("type") == "input_image":
                         image_block = _STR_KEY_DICT_ADAPTER.validate_python(
@@ -2552,6 +2604,18 @@ class LiteLLMCompletionResponsesConfig:
                         if "cache_control" in item:
                             image_block["cache_control"] = item["cache_control"]
                         content_list.append(image_block)
+                    elif item.get("type") in ("input_audio", "image_url"):
+                        match _validate_responses_media(partial(_STR_KEY_DICT_ADAPTER.validate_python, item)):
+                            case {"type": "input_audio"} as audio_part:
+                                content_list.append(
+                                    dict(
+                                        _validate_responses_media(
+                                            partial(_AUDIO_PART_ADAPTER.validate_python, audio_part)
+                                        )
+                                    )
+                                )
+                            case image_part:
+                                content_list.append(image_part)
                     elif item.get("type") == "encrypted_content":
                         encrypted_content = item.get("encrypted_content")
                         if encrypted_content is not None:

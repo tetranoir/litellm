@@ -18,7 +18,7 @@ from typing_extensions import NotRequired, ReadOnly, TypedDict
 import litellm
 from litellm._logging import verbose_logger
 from litellm.litellm_core_utils.asyncify import asyncify
-from litellm.litellm_core_utils.core_helpers import drops_unsupported_params
+from litellm.litellm_core_utils.core_helpers import as_str_mapping, drops_unsupported_params
 from litellm.litellm_core_utils.get_model_cost_map import GetModelCostMap
 from litellm.litellm_core_utils.prompt_templates.common_utils import (
     get_image_mime_type_from_url,
@@ -28,6 +28,7 @@ from litellm.litellm_core_utils.prompt_templates.factory import (
     convert_to_anthropic_image_obj,
     convert_to_gemini_tool_call_invoke,
     convert_to_gemini_tool_call_result,
+    gemini_media_source,
     get_thought_signature_from_tool,
     response_schema_prompt,
 )
@@ -478,7 +479,7 @@ def _normalize_and_validate_gemini_mime_type(mime_type: str, model: str | None) 
     return get_file_mime_type_for_file_type(file_type)
 
 
-def _process_gemini_media(
+def process_gemini_media(
     image_url: str,
     format: str | None = None,
     media_resolution_enum: dict[str, str] | None = None,
@@ -588,6 +589,9 @@ def _process_gemini_media(
         raise e
 
 
+_process_gemini_media: Final = process_gemini_media
+
+
 def snake_to_camel(snake_str: str) -> str:
     """Convert snake_case to camelCase"""
     components: Final = snake_str.split("_")
@@ -695,6 +699,29 @@ def _collect_tool_call_thought_signatures(
                 signatures += (invocation_signature,)
 
     return frozenset(signatures)
+
+
+def _gemini_history_media_part(
+    content: Mapping[str, object],
+    model: str | None,
+    vertex_project: str | None,
+    vertex_credentials: VERTEX_CREDENTIALS_TYPES | None,
+) -> PartType | None:
+    source: Final = gemini_media_source(content)
+    if source is None:
+        return None
+    media_url, media_format = source
+    fields: Final = as_str_mapping(content.get("image_url") or content.get("file")) or {}
+    detail: Final = fields.get("detail")
+    return process_gemini_media(
+        image_url=media_url,
+        format=media_format,
+        model=model,
+        vertex_project=vertex_project,
+        vertex_credentials=vertex_credentials,
+        media_resolution_enum=_convert_detail_to_media_resolution_enum(detail if isinstance(detail, str) else None),
+        video_metadata=as_str_mapping(fields.get("video_metadata")),
+    )
 
 
 def gemini_convert_messages_with_history(
@@ -902,6 +929,16 @@ def gemini_convert_messages_with_history(
                             if element["type"] == "text":
                                 _part = PartType(text=element["text"])
                                 _parts.append(_part)
+                            elif (
+                                element["type"] in ("image_url", "file")
+                                and (
+                                    media_part := _gemini_history_media_part(
+                                        element, model, vertex_project, vertex_credentials
+                                    )
+                                )
+                                is not None
+                            ):
+                                _parts.append(media_part)
 
                     assistant_content.extend(_parts)
                 elif _message_content is not None and isinstance(_message_content, str):
@@ -1033,6 +1070,8 @@ def gemini_convert_messages_with_history(
                     last_message_with_tool_calls,
                     forward_function_call_id=forward_function_call_id,
                     supports_multimodal_function_responses=supports_multimodal_function_responses,
+                    custom_llm_provider=custom_llm_provider,
+                    model=model,
                 )
                 msg_i += 1
                 # Handle both single part and list of parts (for Computer Use with images)

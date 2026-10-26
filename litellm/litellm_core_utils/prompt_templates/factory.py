@@ -56,10 +56,12 @@ from litellm.types.llms.openai import (
 )
 from litellm.types.llms.vertex_ai import FunctionCall as VertexFunctionCall
 from litellm.types.llms.vertex_ai import FunctionResponse as VertexFunctionResponse
+from litellm.types.llms.vertex_ai import FunctionResponsePartType
 from litellm.types.llms.vertex_ai import PartType as VertexPartType
 from litellm.types.utils import GenericImageParsingChunk
 
 from .common_utils import (
+    as_openai_image_part,
     converse_redacted_content,
     convert_content_list_to_str,
     has_blank_redacted_data,
@@ -1486,11 +1488,117 @@ def _contains_part_reference(payload: JsonValue) -> bool:
     return any(_is_part_reference(node) for node in itertools.chain.from_iterable(levels))
 
 
+def _tool_media_format(fields: Mapping[str, object]) -> str | None:
+    hint: Final = fields.get("format") or fields.get("mime_type") or fields.get("content_type")
+    return hint if isinstance(hint, str) else None
+
+
+def gemini_media_source(content: Mapping[str, object]) -> tuple[str, str | None] | None:
+    content_type: Final = content.get("type")
+    if content_type in ("image", "input_image", "image_url"):
+        image: Final = as_openai_image_part(content)
+        if image is None:
+            return None
+        image_url: Final = image["image_url"]
+        image_fields: Final = as_str_mapping(content.get("image_url"))
+        return (
+            image_url if isinstance(image_url, str) else image_url["url"],
+            _tool_media_format(image_fields or content),
+        )
+    if content_type == "input_audio":
+        audio: Final = as_str_mapping(content.get("input_audio"))
+        if audio is None:
+            return None
+        audio_data: Final = audio.get("data")
+        audio_format: Final = audio.get("format")
+        if not isinstance(audio_data, str) or not isinstance(audio_format, str):
+            return None
+        audio_mime: Final = audio_format if audio_format.startswith("audio/") else f"audio/{audio_format}"
+        return (
+            convert_generic_image_chunk_to_openai_image_obj(
+                GenericImageParsingChunk(type="base64", media_type=audio_mime, data=audio_data)
+            ),
+            audio_mime,
+        )
+    if content_type not in ("file", "input_file"):
+        return None
+    nested_file: Final = content.get("file")
+    file: Final = as_str_mapping(nested_file) or content
+    file_source: Final = next(
+        (
+            source
+            for source in (file.get("file_data"), file.get("file_id"), file.get("file_url"), nested_file)
+            if isinstance(source, str) and source
+        ),
+        None,
+    )
+    if file_source is None:
+        return None
+    file_format: Final = _tool_media_format(file) or _tool_media_format(content)
+    if (
+        file.get("file_data") == file_source
+        and file_format
+        and not file_source.startswith(("data:", "http://", "https://", "gs://"))
+    ):
+        return (
+            convert_generic_image_chunk_to_openai_image_obj(
+                GenericImageParsingChunk(type="base64", media_type=file_format, data=file_source)
+            ),
+            file_format,
+        )
+    return file_source, file_format
+
+
+def _gemini_tool_media_part(
+    content: Mapping[str, object], custom_llm_provider: str | None, model: str | None
+) -> FunctionResponsePartType | None:
+    from litellm.llms.vertex_ai.common_utils import GEMINI_FILES_API_URI_PREFIX
+
+    source: Final = gemini_media_source(content)
+    if source is None:
+        return None
+    url, media_format = source
+    native_uri: Final = url.startswith(("gs://", GEMINI_FILES_API_URI_PREFIX))
+    vertex_uri: Final = custom_llm_provider in ("vertex_ai", "vertex_ai_beta") and (
+        native_uri or (url.startswith("https://") and media_format is not None)
+    )
+    if native_uri and not vertex_uri:
+        raise litellm.BadRequestError(
+            message="Gemini tool results require inline media data. Use a data URL or input_audio for this file reference.",
+            model=model or "",
+            llm_provider=custom_llm_provider or "gemini",
+        )
+    if vertex_uri:
+        from litellm.llms.vertex_ai.gemini.transformation import process_gemini_media
+
+        if media_format is None:
+            raise litellm.BadRequestError(
+                message="Vertex tool result file references require an explicit MIME type in format.",
+                model=model or "",
+                llm_provider=custom_llm_provider or "vertex_ai",
+            )
+        part: Final = process_gemini_media(image_url=url, format=media_format, model=model)
+        if "file_data" in part:
+            return {"file_data": part["file_data"]}
+        if "inline_data" in part:
+            return {"inline_data": part["inline_data"]}
+        return None
+    try:
+        inline: Final = convert_to_anthropic_image_obj(url, format=media_format)
+        return {"inline_data": {"data": inline["data"], "mime_type": inline["media_type"]}}
+    except Exception as exc:
+        verbose_logger.warning("Failed to process media in tool response: %s", exc)
+        return None
+
+
 def convert_to_gemini_tool_call_result(
     message: ChatCompletionToolMessage | ChatCompletionFunctionMessage,
     last_message_with_tool_calls: dict | None,
     forward_function_call_id: bool = False,
     supports_multimodal_function_responses: bool = True,
+    *,
+    custom_llm_provider: str | None = None,
+    model: str | None = None,
 ) -> VertexPartType | list[VertexPartType]:
     """
     OpenAI message with a tool result looks like:
@@ -1521,7 +1629,7 @@ def convert_to_gemini_tool_call_result(
     from litellm.types.llms.vertex_ai import BlobType
 
     content_str: str = ""
-    inline_data_list: Final[list[BlobType]] = []
+    media_parts: Final[list[FunctionResponsePartType]] = []
 
     if "content" in message:
         if isinstance(message["content"], str):
@@ -1535,7 +1643,7 @@ def convert_to_gemini_tool_call_result(
                     if len(mime_rest) == 2 and mime_rest[0].startswith("image/"):
                         # Strip any extra parameters (e.g. ";charset=UTF-8") from the MIME segment
                         clean_mime: Final = mime_rest[0].split(";")[0].strip()
-                        inline_data_list.append(BlobType(data=mime_rest[1], mime_type=clean_mime))
+                        media_parts.append({"inline_data": BlobType(data=mime_rest[1], mime_type=clean_mime)})
                         content_str = ""
                 except Exception as e:
                     verbose_logger.warning("Failed to parse data URL in tool response: %s", e)
@@ -1545,61 +1653,8 @@ def convert_to_gemini_tool_call_result(
                 content_type = content.get("type", "")
                 if content_type == "text":
                     content_str += content.get("text", "")
-                elif content_type == "image":  # pyright: ignore[reportUnnecessaryComparison]  # loose runtime dict
-                    # Anthropic-native image block: {"type": "image", "source": {"type": "base64", ...}}
-                    source = content.get("source", {})
-                    if isinstance(source, dict) and source.get("type") == "base64":
-                        try:
-                            inline_data_list.append(
-                                BlobType(
-                                    data=source.get("data", ""),
-                                    mime_type=source.get("media_type", "image/jpeg"),
-                                )
-                            )
-                        except Exception as e:
-                            verbose_logger.warning("Failed to process Anthropic image block in tool response: %s", e)
-                elif content_type in ("input_image", "image_url"):
-                    # Extract image for inline_data (for Computer Use screenshots and tool results)
-                    image_url_data = content.get("image_url", "")
-                    image_url = image_url_data.get("url", "") if isinstance(image_url_data, dict) else image_url_data
-
-                    if image_url:
-                        # Convert image to base64 blob format for Gemini
-                        try:
-                            image_obj = convert_to_anthropic_image_obj(image_url, format=None)
-                            inline_data_list.append(
-                                BlobType(
-                                    data=image_obj["data"],
-                                    mime_type=image_obj["media_type"],
-                                )
-                            )
-                        except Exception as e:
-                            verbose_logger.warning("Failed to process image in tool response: %s", e)
-                elif content_type in ("file", "input_file"):  # pyright: ignore[reportUnnecessaryContains]  # loose runtime dict
-                    # Extract file for inline_data (for tool results with PDF, audio, video, etc.)
-                    file_data = content.get("file_data", "")
-                    if not file_data:
-                        file_content = content.get("file", {})
-                        file_data = (
-                            file_content.get("file_data", "")
-                            if isinstance(file_content, dict)
-                            else file_content
-                            if isinstance(file_content, str)
-                            else ""
-                        )
-
-                    if file_data:
-                        # Convert file to base64 blob format for Gemini
-                        try:
-                            file_obj = convert_to_anthropic_image_obj(file_data, format=None)
-                            inline_data_list.append(
-                                BlobType(
-                                    data=file_obj["data"],
-                                    mime_type=file_obj["media_type"],
-                                )
-                            )
-                        except Exception as e:
-                            verbose_logger.warning("Failed to process file in tool response: %s", e)
+                elif (media_part := _gemini_tool_media_part(content, custom_llm_provider, model)) is not None:
+                    media_parts.append(media_part)
     name: str | None = message.get("name", "")
 
     # Recover name from last message with tool calls
@@ -1653,10 +1708,10 @@ def convert_to_gemini_tool_call_result(
 
     _part: Final[VertexPartType] = {"function_response": _function_response}
 
-    if inline_data_list:
+    if media_parts:
         if not supports_multimodal_function_responses:
-            return [_part, *(VertexPartType(inline_data=inline_data) for inline_data in inline_data_list)]
-        _function_response["parts"] = [{"inline_data": inline_data} for inline_data in inline_data_list]
+            return [_part, *(VertexPartType(**media_part) for media_part in media_parts)]
+        _function_response["parts"] = media_parts
         return [_part]
 
     return _part
@@ -1803,8 +1858,7 @@ def convert_to_anthropic_tool_result(
             elif content["type"] == "tool_reference":
                 anthropic_content_list.append(ToolReference(type="tool_reference", tool_name=content["tool_name"]))
             elif content["type"] == "file":
-                file_content = cast(ChatCompletionFileObject, content)
-                _file_block = anthropic_process_openai_file_message(file_content)
+                _file_block = anthropic_process_openai_file_message(content)
                 _file_block = add_cache_control_to_content(
                     anthropic_content_element=cast(AnthropicMessagesDocumentParam, _file_block),
                     original_content_element=content,
@@ -2069,7 +2123,7 @@ def add_cache_control_to_content(
     | AnthropicMessagesDocumentParam
     | AnthropicMessagesToolUseParam
     | ChatCompletionThinkingBlock,
-    original_content_element: dict | AllMessageValues,
+    original_content_element: dict | AllMessageValues | ChatCompletionFileObject,
 ):
     cache_control_param: Final = original_content_element.get("cache_control")
     if cache_control_param is not None and isinstance(cache_control_param, dict):

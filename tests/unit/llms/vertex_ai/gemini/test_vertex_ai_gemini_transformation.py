@@ -1,8 +1,8 @@
 import base64
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from itertools import chain
 from pathlib import Path
-from typing import Final, Literal
+from typing import Final, Literal, cast
 
 import httpx
 import pytest
@@ -19,8 +19,85 @@ from litellm.llms.vertex_ai.gemini.transformation import (
     gemini_convert_messages_with_history,
     transform_request_body,
 )
+from litellm.responses.litellm_completion_transformation.transformation import LiteLLMCompletionResponsesConfig
+from litellm.types.llms.openai import AllMessageValues
 from litellm.types.llms.vertex_ai import BlobType, ContentType, PartType
 from litellm.types.utils import Message
+
+
+def _responses_tool_media_history(content: Mapping[str, object]) -> list[AllMessageValues]:
+    output: Final = (
+        LiteLLMCompletionResponsesConfig._transform_responses_api_tool_call_output_to_chat_completion_message(
+            {
+                "call_id": "call_media",
+                "output": [{"type": "input_text", "text": '{"ok":true}'}, content],
+            }
+        )
+    )
+    return [
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {"id": "call_media", "type": "function", "function": {"name": "get_media", "arguments": "{}"}}
+            ],
+        },
+        *cast(list[AllMessageValues], output),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("part", "provider"),
+    [
+        ({"type": "input_audio", "input_audio": {"data": "c291bmQ=", "format": "wav"}}, "gemini"),
+        ({"type": "input_file", "file_data": "c291bmQ=", "format": "audio/wav"}, "vertex_ai"),
+        ({"type": "file", "file": {"file_data": "c291bmQ=", "format": "audio/wav"}}, "vertex_ai_beta"),
+    ],
+)
+def test_responses_tool_audio_reaches_gemini_history(part: Mapping[str, object], provider: str) -> None:
+    result: Final = gemini_convert_messages_with_history(
+        _responses_tool_media_history(part), custom_llm_provider=provider
+    )
+    assert result[-1]["parts"] == [
+        {
+            "function_response": {
+                "name": "get_media",
+                "response": {"ok": True},
+                "parts": [{"inline_data": {"data": "c291bmQ=", "mime_type": "audio/wav"}}],
+            }
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("uri", "field", "provider"),
+    [
+        ("gs://media-test/extensionless", "file_id", "vertex_ai"),
+        ("https://generativelanguage.googleapis.com/v1beta/files/media-test", "file_url", "vertex_ai_beta"),
+        ("https://media.example/audio", "file_url", "vertex_ai"),
+    ],
+)
+def test_responses_tool_uri_reaches_vertex_function_response(uri: str, field: str, provider: str) -> None:
+    messages: Final = _responses_tool_media_history({"type": "input_file", field: uri, "format": "audio/wav"})
+    result: Final = gemini_convert_messages_with_history(messages, custom_llm_provider=provider)
+    # Checked 2026-10-26: https://cloud.google.com/vertex-ai/generative-ai/docs/reference/rest/v1/Content#FunctionResponsePart
+    assert result[-1]["parts"] == [
+        {
+            "function_response": {
+                "name": "get_media",
+                "response": {"ok": True},
+                "parts": [{"file_data": {"file_uri": uri, "mime_type": "audio/wav"}}],
+            }
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    "uri", ["gs://media-test/extensionless", "https://generativelanguage.googleapis.com/v1beta/files/media-test"]
+)
+def test_gemini_tool_uri_fails_explicitly_when_inline_data_is_required(uri: str) -> None:
+    messages: Final = _responses_tool_media_history({"type": "input_file", "file_id": uri, "format": "audio/wav"})
+    with pytest.raises(litellm.BadRequestError, match="tool results require inline media data"):
+        gemini_convert_messages_with_history(messages, custom_llm_provider="gemini")
 
 
 def test_check_if_part_exists_in_parts():
