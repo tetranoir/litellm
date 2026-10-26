@@ -63,6 +63,11 @@ from litellm.llms.deepgram.common_utils import (
     deepgram_listen_registry_key,
     deepgram_listen_requested_model,
     deepgram_listen_websocket_target,
+    deepgram_speak_characters,
+    deepgram_speak_is_priced,
+    deepgram_speak_registry_key,
+    deepgram_speak_requested_model,
+    deepgram_speak_websocket_target,
 )
 from litellm.llms.fal_ai.cost_calculator import fal_ai_passthrough_cost, fal_ai_queue_base
 from litellm.llms.nvidia_nim.passthrough.transformation import nvidia_nim_model_group_in_path
@@ -3341,6 +3346,7 @@ class _WebsocketRelay(Protocol):
         forward_headers: bool,
         endpoint: str,
         accept_websocket: bool,
+        count_client_text: Callable[[str | bytes], int] | None = None,
     ) -> None: ...
 
 
@@ -3473,6 +3479,7 @@ class _DeepgramWebsocketProduct:
     is_priced: Callable[[str], bool]
     registry_key: Callable[[str], str]
     refusal: Callable[[str], str | None] | None = None
+    count_client_text: Callable[[str | bytes], int] | None = None
 
 
 _DEEPGRAM_LISTEN: Final = _DeepgramWebsocketProduct(
@@ -3480,6 +3487,12 @@ _DEEPGRAM_LISTEN: Final = _DeepgramWebsocketProduct(
     is_priced=deepgram_listen_is_priced,
     registry_key=deepgram_listen_registry_key,
     refusal=_deepgram_listen_refusal,
+)
+_DEEPGRAM_SPEAK: Final = _DeepgramWebsocketProduct(
+    target=deepgram_speak_websocket_target,
+    is_priced=deepgram_speak_is_priced,
+    registry_key=deepgram_speak_registry_key,
+    count_client_text=deepgram_speak_characters,
 )
 
 
@@ -3519,6 +3532,7 @@ async def _relay_deepgram_websocket(
         forward_headers=False,
         endpoint=websocket.url.path,
         accept_websocket=False,
+        count_client_text=product.count_client_text,
     )
 
 
@@ -3530,6 +3544,24 @@ async def deepgram_listen_websocket_route(
     relay: Annotated[_WebsocketRelay, Depends(_websocket_relay)],
 ) -> None:
     await _relay_deepgram_websocket(websocket, user_api_key_dict, relay, _DEEPGRAM_LISTEN)
+
+
+async def deepgram_speak_user_api_key_auth(websocket: WebSocket) -> UserAPIKeyAuth:
+    return await user_api_key_auth_websocket_for_model(
+        websocket,
+        model=deepgram_speak_requested_model(websocket.url.query),
+        accepted_authorization_schemes=_DEEPGRAM_WS_AUTHORIZATION_SCHEMES,
+    )
+
+
+@router.websocket("/deepgram/v1/speak")
+@router.websocket("/deepgram/speak")
+async def deepgram_speak_websocket_route(
+    websocket: WebSocket,
+    user_api_key_dict: Annotated[UserAPIKeyAuth, Depends(deepgram_speak_user_api_key_auth)],
+    relay: Annotated[_WebsocketRelay, Depends(_websocket_relay)],
+) -> None:
+    await _relay_deepgram_websocket(websocket, user_api_key_dict, relay, _DEEPGRAM_SPEAK)
 
 
 class BaseOpenAIPassThroughHandler:
