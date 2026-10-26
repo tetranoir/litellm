@@ -7,7 +7,7 @@ import os
 import sys
 import uuid
 import zlib
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Coroutine, Mapping
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -27,6 +27,7 @@ from fastapi.testclient import TestClient
 from pydantic import TypeAdapter, ValidationError
 from starlette.datastructures import FormData, Headers, QueryParams
 from starlette.datastructures import UploadFile as StarletteUploadFile
+from starlette.websockets import WebSocketDisconnect
 
 import litellm
 from litellm._logging import verbose_proxy_logger
@@ -7615,6 +7616,59 @@ async def test_websocket_passthrough_sends_deepgram_audio_bytes_and_control_text
     assert [call.args[0] for call in upstream_ws.send.await_args_list] == [audio_chunk, close_stream]
     assert isinstance(upstream_ws.send.await_args_list[0].args[0], bytes)
     upstream_ws.close.assert_awaited_once()
+
+
+AFTER_HANG_UP_FRAME = json.dumps({"type": "Metadata", "request_id": "after-hang-up"})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "client_send_error",
+    [
+        pytest.param(RuntimeError("unable to perform operation on <TCPTransport closed=True>"), id="transport closed"),
+        pytest.param(WebSocketDisconnect(code=1006), id="socket failed"),
+    ],
+)
+async def test_websocket_passthrough_bills_a_session_whose_client_hangs_up_while_upstream_is_sending(
+    client_send_error: Exception,
+):
+    """A client that hangs up mid-stream has still used what the upstream produced, so the session is logged like a
+    normal disconnect, including the frame whose send failed, and not as a proxy error"""
+    upstream_ws = FakeUpstreamWebSocket(
+        DEEPGRAM_METADATA_FRAME, b"\x00\x01audio", DEEPGRAM_FINAL_FRAME, AFTER_HANG_UP_FRAME
+    )
+    websocket = _client_websocket(_pending_receive)
+    websocket.send_text = AsyncMock(side_effect=[None, client_send_error])
+    logged_response_bodies: list[object] = []  # mutable-ok: record_success appends each logged session
+
+    def record_success(**kwargs: object) -> Coroutine[object, object, None]:
+        logged_response_bodies.append(kwargs["response_body"])
+        return asyncio.sleep(0)
+
+    with (
+        _patched_websocket_passthrough_environment(upstream_ws),
+        patch(  # test-quality-ok: pass_through_endpoint_logging is a module global read inside websocket_passthrough_request; there is no injection seam
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints."
+            "pass_through_endpoint_logging.pass_through_async_success_handler",
+            new=record_success,
+        ),
+    ):
+        from litellm.proxy.proxy_server import proxy_logging_obj
+
+        await websocket_passthrough_request(
+            websocket=websocket,
+            target=DEEPGRAM_LISTEN_TARGET,
+            custom_headers={"Authorization": "Token dg-provider-key"},
+            user_api_key_dict=UserAPIKeyAuth(),
+            forward_headers=False,
+            endpoint="/deepgram/v1/listen",
+            accept_websocket=False,
+        )
+        failure_hook = proxy_logging_obj.post_call_failure_hook
+
+    assert logged_response_bodies == [[json.loads(DEEPGRAM_METADATA_FRAME), json.loads(DEEPGRAM_FINAL_FRAME)]]
+    failure_hook.assert_not_awaited()
+    assert all(call.kwargs.get("code") != 1011 for call in websocket.close.await_args_list)
 
 
 @pytest.mark.asyncio
