@@ -3462,12 +3462,32 @@ async def deepgram_listen_user_api_key_auth(websocket: WebSocket) -> UserAPIKeyA
     )
 
 
-@router.websocket("/deepgram/v1/listen")
-@router.websocket("/deepgram/listen")
-async def deepgram_listen_websocket_route(
+def _deepgram_listen_refusal(query_string: str) -> str | None:
+    callback_params: Final = deepgram_listen_callback_params(query_string)
+    return _DEEPGRAM_WS_CALLBACK_REASON.format(params=", ".join(callback_params)) if callback_params else None
+
+
+@dataclass(frozen=True, slots=True)
+class _DeepgramWebsocketProduct:
+    target: Callable[[str | None, str], str]
+    is_priced: Callable[[str], bool]
+    registry_key: Callable[[str], str]
+    refusal: Callable[[str], str | None] | None = None
+
+
+_DEEPGRAM_LISTEN: Final = _DeepgramWebsocketProduct(
+    target=deepgram_listen_websocket_target,
+    is_priced=deepgram_listen_is_priced,
+    registry_key=deepgram_listen_registry_key,
+    refusal=_deepgram_listen_refusal,
+)
+
+
+async def _relay_deepgram_websocket(
     websocket: WebSocket,
-    user_api_key_dict: Annotated[UserAPIKeyAuth, Depends(deepgram_listen_user_api_key_auth)],
-    relay: Annotated[_WebsocketRelay, Depends(_websocket_relay)],
+    user_api_key_dict: UserAPIKeyAuth,
+    relay: _WebsocketRelay,
+    product: _DeepgramWebsocketProduct,
 ) -> None:
     deepgram_api_key: Final = passthrough_endpoint_router.get_credentials(
         custom_llm_provider=litellm.LlmProviders.DEEPGRAM.value,
@@ -3478,22 +3498,16 @@ async def deepgram_listen_websocket_route(
         return
 
     await websocket.accept(subprotocol=_negotiated_websocket_subprotocol(websocket))
-    callback_params: Final = deepgram_listen_callback_params(websocket.url.query)
-    if callback_params:
-        await websocket.close(
-            code=1008,
-            reason=_DEEPGRAM_WS_CALLBACK_REASON.format(params=", ".join(callback_params)),
-        )
+    refusal: Final = None if product.refusal is None else product.refusal(websocket.url.query)
+    if refusal is not None:
+        await websocket.close(code=1008, reason=refusal)
         return
 
-    target: Final = deepgram_listen_websocket_target(
-        api_base=get_secret_str("DEEPGRAM_API_BASE"),
-        query_string=websocket.url.query,
-    )
-    if not deepgram_listen_is_priced(target):
+    target: Final = product.target(get_secret_str("DEEPGRAM_API_BASE"), websocket.url.query)
+    if not product.is_priced(target):
         await websocket.close(
             code=1008,
-            reason=_DEEPGRAM_WS_UNPRICED_REASON.format(registry_key=deepgram_listen_registry_key(target)),
+            reason=_DEEPGRAM_WS_UNPRICED_REASON.format(registry_key=product.registry_key(target)),
         )
         return
 
@@ -3506,6 +3520,16 @@ async def deepgram_listen_websocket_route(
         endpoint=websocket.url.path,
         accept_websocket=False,
     )
+
+
+@router.websocket("/deepgram/v1/listen")
+@router.websocket("/deepgram/listen")
+async def deepgram_listen_websocket_route(
+    websocket: WebSocket,
+    user_api_key_dict: Annotated[UserAPIKeyAuth, Depends(deepgram_listen_user_api_key_auth)],
+    relay: Annotated[_WebsocketRelay, Depends(_websocket_relay)],
+) -> None:
+    await _relay_deepgram_websocket(websocket, user_api_key_dict, relay, _DEEPGRAM_LISTEN)
 
 
 class BaseOpenAIPassThroughHandler:
