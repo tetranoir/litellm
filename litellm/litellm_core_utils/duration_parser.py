@@ -278,6 +278,15 @@ def _handle_day_reset(
         return _apply_time_of_day(base_midnight + timedelta(days=value), reset_time_of_day)
 
 
+def _at_offset_from_midnight(base_midnight: datetime, hours: int, minutes: int, seconds: int) -> datetime:
+    """Wall-clock instant `hours:minutes:seconds` after `base_midnight`, carrying any
+    overflow into later days instead of wrapping it back into the same day."""
+    extra_minutes, second = divmod(seconds, 60)
+    extra_hours, minute = divmod(minutes + extra_minutes, 60)
+    days, hour = divmod(hours + extra_hours, 24)
+    return (base_midnight + timedelta(days=days)).replace(hour=hour, minute=minute, second=second, microsecond=0)
+
+
 def _handle_hour_reset(current_time: datetime, base_midnight: datetime, value: int) -> datetime:
     """Handle hour-based reset times."""
     # Handle zero value - immediate expiration
@@ -295,13 +304,7 @@ def _handle_hour_reset(current_time: datetime, base_midnight: datetime, value: i
     else:
         next_hour = current_hour + value - (current_hour % value) if current_hour % value != 0 else current_hour + value
 
-    # Handle overnight case
-    if next_hour >= 24:
-        next_hour = next_hour % 24
-        next_day: Final = base_midnight + timedelta(days=1)
-        return next_day.replace(hour=next_hour)
-
-    return current_time.replace(hour=next_hour, minute=0, second=0, microsecond=0)
+    return _at_offset_from_midnight(base_midnight, next_hour, 0, 0)
 
 
 def _handle_minute_reset(current_time: datetime, base_midnight: datetime, value: int) -> datetime:
@@ -325,17 +328,7 @@ def _handle_minute_reset(current_time: datetime, base_midnight: datetime, value:
             current_minute + value - (current_minute % value) if current_minute % value != 0 else current_minute + value
         )
 
-    # Handle hour rollover
-    next_hour = current_hour + (next_minute // 60)
-    next_minute = next_minute % 60
-
-    # Handle overnight case
-    if next_hour >= 24:
-        next_hour = next_hour % 24
-        next_day: Final = base_midnight + timedelta(days=1)
-        return next_day.replace(hour=next_hour, minute=next_minute, second=0, microsecond=0)
-
-    return current_time.replace(hour=next_hour, minute=next_minute, second=0, microsecond=0)
+    return _at_offset_from_midnight(base_midnight, current_hour, next_minute, 0)
 
 
 def _handle_second_reset(current_time: datetime, base_midnight: datetime, value: int) -> datetime:
@@ -359,22 +352,7 @@ def _handle_second_reset(current_time: datetime, base_midnight: datetime, value:
             current_second + value - (current_second % value) if current_second % value != 0 else current_second + value
         )
 
-    # Handle minute rollover
-    additional_minutes: Final = next_second // 60
-    next_second = next_second % 60
-    next_minute = current_minute + additional_minutes
-
-    # Handle hour rollover
-    next_hour = current_hour + (next_minute // 60)
-    next_minute = next_minute % 60
-
-    # Handle overnight case
-    if next_hour >= 24:
-        next_hour = next_hour % 24
-        next_day: Final = base_midnight + timedelta(days=1)
-        return next_day.replace(hour=next_hour, minute=next_minute, second=next_second, microsecond=0)
-
-    return current_time.replace(hour=next_hour, minute=next_minute, second=next_second, microsecond=0)
+    return _at_offset_from_midnight(base_midnight, current_hour, current_minute, next_second)
 
 
 def _handle_month_reset(

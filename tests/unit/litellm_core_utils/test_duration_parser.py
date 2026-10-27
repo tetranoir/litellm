@@ -399,6 +399,31 @@ def test_fixed_length_units_do_not_depend_on_the_start(duration):
     )
 
 
+@pytest.mark.parametrize(
+    "now,duration,expected",
+    [
+        (datetime(2023, 5, 15, 10, 0, tzinfo=timezone.utc), "48h", datetime(2023, 5, 17, 0, 0, tzinfo=timezone.utc)),
+        (datetime(2023, 5, 15, 10, 0, tzinfo=timezone.utc), "72h", datetime(2023, 5, 18, 0, 0, tzinfo=timezone.utc)),
+        (datetime(2023, 5, 15, 10, 0, tzinfo=timezone.utc), "36h", datetime(2023, 5, 16, 12, 0, tzinfo=timezone.utc)),
+        (datetime(2023, 5, 15, 10, 0, tzinfo=timezone.utc), "2880m", datetime(2023, 5, 17, 10, 0, tzinfo=timezone.utc)),
+        (datetime(2023, 5, 15, 10, 0, tzinfo=timezone.utc), "172800s", datetime(2023, 5, 17, 10, 0, tzinfo=timezone.utc)),
+        (datetime(2023, 5, 31, 23, 30, tzinfo=timezone.utc), "48h", datetime(2023, 6, 2, 0, 0, tzinfo=timezone.utc)),
+        (datetime(2023, 5, 15, 23, 30, tzinfo=timezone.utc), "90m", datetime(2023, 5, 16, 0, 30, tzinfo=timezone.utc)),
+    ],
+    ids=["48h", "72h", "36h", "2880m", "172800s", "48h_across_month_end", "90m_wraps_one_day"],
+)
+def test_sub_day_units_longer_than_a_day_reset_after_the_full_duration(now, duration, expected):
+    assert get_next_standardized_reset_time(duration, now, "UTC") == expected
+
+
+@pytest.mark.parametrize("duration", ["48h", "72h", "2880m", "172800s"])
+def test_multi_day_hour_duration_is_not_collapsed_to_the_next_midnight(duration):
+    now: Final = datetime(2023, 5, 15, 10, 0, tzinfo=timezone.utc)
+    reset_at: Final = get_next_standardized_reset_time(duration, now, "UTC")
+    assert (reset_at - now).total_seconds() > 86400
+    assert reset_at == get_next_standardized_reset_time(duration, get_budget_window_start(duration, reset_at), "UTC")
+
+
 def test_a_month_starting_now_matches_duration_in_seconds():
     now: Final = datetime(2026, 1, 31, 9, 30, 0, 250000, tzinfo=timezone.utc).astimezone()
     with patch.object(duration_parser.time_module, "time", return_value=now.timestamp()):
